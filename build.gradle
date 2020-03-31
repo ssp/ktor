@@ -183,6 +183,10 @@ allprojects {
                 }
             }
         }
+
+        sourceSets.matching({ it.name.contains("Main") }).all { srcSet ->
+            project.ext.set("kotlin.mpp.freeCompilerArgsForSourceSet.${srcSet.name}", "-Xexplicit-api=warning")
+        }
     }
 
 
@@ -285,7 +289,9 @@ subprojects {
 
         def coverageSourceDirs = [
             "common/src",
-            "jvm/src"
+            "jvm/src",
+            "common/test",
+            "jvm/test"
         ]
         classDirectories.from files(fileTree(dir: "${buildDir}/classes/kotlin/jvm/"))
         sourceDirectories.from files(coverageSourceDirs)
@@ -302,9 +308,9 @@ subprojects {
     }
 }
 
-def findSources(sourceSet) {
+def findSources(String sourceSet) {
     return files(subprojects.findResults {
-        it.kotlin.sourceSets.findByName("jvmMain")?.kotlin?.srcDirs
+        it.kotlin.sourceSets.findByName(sourceSet)?.kotlin?.srcDirs
     })
 }
 
