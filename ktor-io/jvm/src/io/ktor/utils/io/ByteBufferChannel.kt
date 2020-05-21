@@ -1,22 +1,20 @@
 package io.ktor.utils.io
 
-import kotlinx.atomicfu.*
-import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.*
-import io.ktor.utils.io.internal.*
-import io.ktor.utils.io.bits.Memory
-import io.ktor.utils.io.bits.copyTo
+import io.ktor.utils.io.bits.*
 import io.ktor.utils.io.charsets.*
 import io.ktor.utils.io.core.*
 import io.ktor.utils.io.core.Buffer
 import io.ktor.utils.io.core.ByteOrder
+import io.ktor.utils.io.internal.*
 import io.ktor.utils.io.pool.*
+import kotlinx.atomicfu.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.*
 import java.io.EOFException
 import java.nio.*
 import java.util.concurrent.atomic.*
 import kotlin.coroutines.*
 import kotlin.coroutines.intrinsics.*
-import kotlin.jvm.*
 
 internal const val DEFAULT_CLOSE_MESSAGE = "Byte channel was closed"
 
@@ -1313,6 +1311,7 @@ internal open class ByteBufferChannel(
         }
 
         val autoFlush = autoFlush
+
         @Suppress("DEPRECATION_ERROR")
         val byteOrder = writeByteOrder
 
@@ -1855,12 +1854,12 @@ internal open class ByteBufferChannel(
         }
 
         var result: R? = null
-        val rc = reading {
+        val continueReading = reading {
             result = visitor(this@ByteBufferChannel)
             true
         }
 
-        if (!rc) {
+        if (!continueReading) {
             return visitor(TerminatedLookAhead)
         }
 
@@ -2039,21 +2038,21 @@ internal open class ByteBufferChannel(
 
         var consumed = 0
 
-        val ca = CharArray(8192)
-        val cb = CharBuffer.wrap(ca)!!
+        val array = CharArray(8192)
+        val buffer = CharBuffer.wrap(array)
         var eol = false
 
         lookAhead {
-            eol = readLineLoop(out, ca, cb,
+            eol = readLineLoop(out, array, buffer,
                 await = { expected -> availableForRead >= expected },
                 addConsumed = { consumed += it },
-                decode = { it.decodeASCIILine(ca, 0, minOf(ca.size, limit - consumed)) })
+                decode = { it.decodeASCIILine(array, 0, minOf(array.size, limit - consumed)) })
         }
 
         if (eol) return true
         if (consumed == 0 && isClosedForRead) return false
 
-        return readUTF8LineToUtf8Suspend(out, limit - consumed, ca, cb, consumed)
+        return readUTF8LineToUtf8Suspend(out, limit - consumed, array, buffer, consumed)
     }
 
     private inline fun LookAheadSession.readLineLoop(
@@ -2109,30 +2108,42 @@ internal open class ByteBufferChannel(
         }
     }
 
-    private suspend fun readUTF8LineToUtf8Suspend(out: Appendable, limit: Int, ca: CharArray, cb: CharBuffer, consumed0: Int): Boolean {
+    private suspend fun readUTF8LineToUtf8Suspend(
+        out: Appendable,
+        limit: Int,
+        ca: CharArray,
+        cb: CharBuffer,
+        consumed0: Int
+    ): Boolean {
         var consumed1 = 0
         var result = true
 
         lookAheadSuspend {
-            val rc = readLineLoop(out, ca, cb,
+            val rc = readLineLoop(
+                out, ca, cb,
                 await = { awaitAtLeast(it) },
                 addConsumed = { consumed1 += it },
-                decode = { it.decodeUTF8Line(ca, 0, minOf(ca.size, limit - consumed1))})
+                decode = { it.decodeUTF8Line(ca, 0, minOf(ca.size, limit - consumed1)) }
+            )
 
-            if (!rc && isClosedForWrite) {
-                val buffer = request(0, 1)
-                if (buffer != null) {
-                    if (buffer.get() == '\r'.toByte()) {
-                        consumed(1)
-
-                        if (buffer.hasRemaining()) {
-                            throw MalformedInputException("Illegal trailing bytes: ${buffer.remaining()}")
-                        }
-                    } else {
+            if (rc || !isClosedForWrite) {
+                return@lookAheadSuspend
+            }
+            val buffer = request(0, 1)
+            when {
+                buffer != null -> {
+                    if (buffer.get() != '\r'.toByte()) {
                         buffer.position(buffer.position() - 1)
-                        throw MalformedInputException("Illegal trailing byte")
+                        throw TooLongLineException("Line is longer than limit")
                     }
-                } else if (consumed1 == 0 && consumed0 == 0) {
+
+                    consumed(1)
+
+                    if (buffer.hasRemaining()) {
+                        throw MalformedInputException("Illegal trailing bytes: ${buffer.remaining()}")
+                    }
+                }
+                consumed1 == 0 && consumed0 == 0 -> {
                     result = false
                 }
             }
@@ -2141,7 +2152,8 @@ internal open class ByteBufferChannel(
         return result
     }
 
-    override suspend fun <A : kotlin.text.Appendable> readUTF8LineTo(out: A, limit: Int) = readUTF8LineToAscii(out, limit)
+    override suspend fun <A : kotlin.text.Appendable> readUTF8LineTo(out: A, limit: Int) =
+        readUTF8LineToAscii(out, limit)
 
     override suspend fun readUTF8Line(limit: Int): String? {
         val sb = StringBuilder()
@@ -2307,7 +2319,7 @@ internal open class ByteBufferChannel(
     }
 
     private fun shouldResumeReadOp() = joining != null &&
-            (state === ReadWriteBufferState.IdleEmpty || state is ReadWriteBufferState.IdleNonEmpty)
+        (state === ReadWriteBufferState.IdleEmpty || state is ReadWriteBufferState.IdleNonEmpty)
 
     private fun writeSuspendPredicate(size: Int): Boolean {
         val joined = joining
@@ -2322,6 +2334,7 @@ internal open class ByteBufferChannel(
     }
 
     private val writeSuspendContinuationCache = CancellableReusableContinuation<Unit>()
+
     @Volatile
     private var writeSuspensionSize: Int = 0
     private val writeSuspension = { ucont: Continuation<Unit> ->
@@ -2401,7 +2414,7 @@ internal open class ByteBufferChannel(
             if (updater.compareAndSet(this, null, continuation)) {
                 if (predicate() || !updater.compareAndSet(this, continuation, null)) {
                     //if (attachedJob == null && continuation is CancellableContinuation<*>) {
-                        // continuation.initCancellability()
+                    // continuation.initCancellability()
                     //}
                     return true
                 }
@@ -2438,7 +2451,7 @@ internal open class ByteBufferChannel(
 
     // todo: replace with atomicfu
     private inline fun updateState(block: (ReadWriteBufferState) -> ReadWriteBufferState?):
-            Pair<ReadWriteBufferState, ReadWriteBufferState> = update({ state }, State, block)
+        Pair<ReadWriteBufferState, ReadWriteBufferState> = update({ state }, State, block)
 
     // todo: replace with atomicfu
     private inline fun <T : Any> update(
