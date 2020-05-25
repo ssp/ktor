@@ -58,6 +58,9 @@ android {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
     }
+    lintOptions {
+        setAbortOnError(false)
+    }
     defaultConfig {
         minSdkVersion(9)
         targetSdkVersion(29)
